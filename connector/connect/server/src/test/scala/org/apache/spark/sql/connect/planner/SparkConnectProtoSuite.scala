@@ -18,25 +18,26 @@ package org.apache.spark.sql.connect.planner
 
 import java.nio.file.{Files, Paths}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import com.google.protobuf.ByteString
 
-import org.apache.spark.SparkClassNotFoundException
+import org.apache.spark.{SparkClassNotFoundException, SparkIllegalArgumentException}
 import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.Expression
 import org.apache.spark.connect.proto.Join.JoinType
-import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Row, SaveMode}
+import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Observation, Row, SaveMode}
 import org.apache.spark.sql.catalyst.analysis
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, GenericInternalRow, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, LeftAnti, LeftOuter, LeftSemi, PlanTest, RightOuter}
-import org.apache.spark.sql.catalyst.plans.logical.{Distinct, LocalRelation, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{CollectMetrics, Distinct, LocalRelation, LogicalPlan}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.connect.common.InvalidPlanInput
+import org.apache.spark.sql.connect.common.LiteralValueProtoConverter.toLiteralProto
 import org.apache.spark.sql.connect.dsl.MockRemoteSession
 import org.apache.spark.sql.connect.dsl.commands._
 import org.apache.spark.sql.connect.dsl.expressions._
 import org.apache.spark.sql.connect.dsl.plans._
-import org.apache.spark.sql.connect.planner.LiteralValueProtoConverter.toConnectProtoValue
 import org.apache.spark.sql.connector.catalog.{Identifier, InMemoryTableCatalog, TableCatalog}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.CatalogHelper
 import org.apache.spark.sql.execution.arrow.ArrowConverters
@@ -245,7 +246,7 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
 
     val connectPlan3 =
       connectTestRelation.rollup("id".protoAttr, "name".protoAttr)(
-        proto_min(proto.Expression.newBuilder().setLiteral(toConnectProtoValue(1)).build())
+        proto_min(proto.Expression.newBuilder().setLiteral(toLiteralProto(1)).build())
           .as("agg1"))
     val sparkPlan3 =
       sparkTestRelation
@@ -269,7 +270,7 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
 
     val connectPlan3 =
       connectTestRelation.cube("id".protoAttr, "name".protoAttr)(
-        proto_min(proto.Expression.newBuilder().setLiteral(toConnectProtoValue(1)).build())
+        proto_min(proto.Expression.newBuilder().setLiteral(toLiteralProto(1)).build())
           .as("agg1"))
     val sparkPlan3 =
       sparkTestRelation
@@ -282,8 +283,8 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
     val connectPlan1 =
       connectTestRelation.pivot("id".protoAttr)(
         "name".protoAttr,
-        Seq("a", "b", "c").map(toConnectProtoValue))(
-        proto_min(proto.Expression.newBuilder().setLiteral(toConnectProtoValue(1)).build())
+        Seq("a", "b", "c").map(toLiteralProto))(
+        proto_min(proto.Expression.newBuilder().setLiteral(toLiteralProto(1)).build())
           .as("agg1"))
     val sparkPlan1 =
       sparkTestRelation
@@ -295,8 +296,8 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
     val connectPlan2 =
       connectTestRelation.pivot("name".protoAttr)(
         "id".protoAttr,
-        Seq(1, 2, 3).map(toConnectProtoValue))(
-        proto_min(proto.Expression.newBuilder().setLiteral(toConnectProtoValue(1)).build())
+        Seq(1, 2, 3).map(toLiteralProto))(
+        proto_min(proto.Expression.newBuilder().setLiteral(toLiteralProto(1)).build())
           .as("agg1"))
     val sparkPlan2 =
       sparkTestRelation
@@ -304,6 +305,18 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
         .pivot(Column("id"), Seq(1, 2, 3))
         .agg(min(lit(1)).as("agg1"))
     comparePlans(connectPlan2, sparkPlan2)
+  }
+
+  test("GroupingSets expressions") {
+    val connectPlan1 =
+      connectTestRelation.groupingSets(Seq(Seq("id".protoAttr), Seq.empty), "id".protoAttr)(
+        proto_min(proto.Expression.newBuilder().setLiteral(toLiteralProto(1)).build())
+          .as("agg1"))
+    val sparkPlan1 =
+      sparkTestRelation
+        .groupingSets(Seq(Seq(Column("id")), Seq.empty), Column("id"))
+        .agg(min(lit(1)).as("agg1"))
+    comparePlans(connectPlan1, sparkPlan1)
   }
 
   test("Test as(alias: String)") {
@@ -345,6 +358,16 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
 
     val connectPlan2 = connectTestRelation.deduplicate(Seq("id", "name"))
     val sparkPlan2 = sparkTestRelation.dropDuplicates(Seq("id", "name"))
+    comparePlans(connectPlan2, sparkPlan2)
+  }
+
+  test("Test basic deduplicateWithinWatermark") {
+    val connectPlan = connectTestRelation.distinct()
+    val sparkPlan = sparkTestRelation.distinct()
+    comparePlans(connectPlan, sparkPlan)
+
+    val connectPlan2 = connectTestRelation.deduplicateWithinWatermark(Seq("id", "name"))
+    val sparkPlan2 = sparkTestRelation.dropDuplicatesWithinWatermark(Seq("id", "name"))
     comparePlans(connectPlan2, sparkPlan2)
   }
 
@@ -543,21 +566,16 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
     comparePlans(
       connectTestRelation.withColumnsRenamed(Map("id" -> "id1", "id" -> "id2")),
       sparkTestRelation.withColumnsRenamed(Map("id" -> "id1", "id" -> "id2")))
-
-    checkError(
-      exception = intercept[AnalysisException] {
-        transform(
-          connectTestRelation.withColumnsRenamed(
-            Map("id" -> "duplicatedCol", "name" -> "duplicatedCol")))
-      },
-      errorClass = "COLUMN_ALREADY_EXISTS",
-      parameters = Map("columnName" -> "`duplicatedcol`"))
   }
 
   test("Writes fails without path or table") {
-    assertThrows[UnsupportedOperationException] {
+    assertThrows[SparkIllegalArgumentException] {
       transform(localRelation.write())
     }
+  }
+
+  test("Writes without path or table") {
+    transform(localRelation.write(format = Some("noop"), mode = Some("Append")))
   }
 
   test("Write fails with unknown table - AnalysisException") {
@@ -693,7 +711,7 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
         proj(row).copy()
       }
 
-      val localRelationV2 = createLocalRelationProto(schema.toAttributes, inputRows)
+      val localRelationV2 = createLocalRelationProto(schema, inputRows)
 
       val cmd = localRelationV2.writeV2(
         tableName = Some("testcat.table_name"),
@@ -721,7 +739,7 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
         proj(row).copy()
       }
 
-      val localRelationV2 = createLocalRelationProto(schema.toAttributes, inputRows)
+      val localRelationV2 = createLocalRelationProto(schema, inputRows)
 
       val cmd = localRelationV2.writeV2(
         tableName = Some("testcat.table_name"),
@@ -757,7 +775,7 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
         proj(row).copy()
       }
 
-      val localRelationV2 = createLocalRelationProto(schema.toAttributes, inputRows)
+      val localRelationV2 = createLocalRelationProto(schema, inputRows)
 
       spark.sql("CREATE TABLE testcat.table_name (id bigint, data string) USING foo")
 
@@ -794,8 +812,8 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
         proj(row).copy()
       }
 
-      val localRelation1V2 = createLocalRelationProto(schema.toAttributes, inputRows1)
-      val localRelation2V2 = createLocalRelationProto(schema.toAttributes, inputRows2)
+      val localRelation1V2 = createLocalRelationProto(schema, inputRows1)
+      val localRelation2V2 = createLocalRelationProto(schema, inputRows2)
 
       spark.sql(
         "CREATE TABLE testcat.table_name (id bigint, data string) USING foo PARTITIONED BY (id)")
@@ -840,7 +858,7 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
         proj(row).copy()
       }
 
-      val localRelationV2 = createLocalRelationProto(schema.toAttributes, inputRows)
+      val localRelationV2 = createLocalRelationProto(schema, inputRows)
 
       spark.sql(
         "CREATE TABLE testcat.table_name (id bigint, data string) USING foo PARTITIONED BY (id)")
@@ -940,6 +958,67 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
     comparePlans(connectPlan1, sparkPlan1)
   }
 
+  test("Test observe") {
+    val connectPlan0 =
+      connectTestRelation.observe(
+        "my_metric",
+        proto_min("id".protoAttr).as("min_val"),
+        proto_max("id".protoAttr).as("max_val"),
+        proto_sum("id".protoAttr))
+    val sparkPlan0 =
+      sparkTestRelation.observe(
+        "my_metric",
+        min(Column("id")).as("min_val"),
+        max(Column("id")).as("max_val"),
+        sum(Column("id")))
+    comparePlans(connectPlan0, sparkPlan0)
+
+    val connectPlan1 =
+      connectTestRelation.observe("my_metric", proto_min("id".protoAttr).as("min_val"))
+    val sparkPlan1 =
+      sparkTestRelation.observe("my_metric", min(Column("id")).as("min_val"))
+    comparePlans(connectPlan1, sparkPlan1)
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        analyzePlan(
+          transform(connectTestRelation.observe("my_metric", "id".protoAttr.cast("string"))))
+      },
+      errorClass = "INVALID_OBSERVED_METRICS.NON_AGGREGATE_FUNC_ARG_IS_ATTRIBUTE",
+      parameters = Map("expr" -> "\"id AS id\""))
+
+    val connectPlan2 =
+      connectTestRelation.observe(
+        Observation("my_metric"),
+        proto_min("id".protoAttr).as("min_val"),
+        proto_max("id".protoAttr).as("max_val"),
+        proto_sum("id".protoAttr))
+    val sparkPlan2 =
+      sparkTestRelation.observe(
+        Observation("my_metric"),
+        min(Column("id")).as("min_val"),
+        max(Column("id")).as("max_val"),
+        sum(Column("id")))
+    comparePlans(connectPlan2, sparkPlan2)
+
+    val connectPlan3 =
+      connectTestRelation.observe(
+        Observation("my_metric"),
+        proto_min("id".protoAttr).as("min_val"))
+    val sparkPlan3 =
+      sparkTestRelation.observe(Observation("my_metric"), min(Column("id")).as("min_val"))
+    comparePlans(connectPlan3, sparkPlan3)
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        analyzePlan(
+          transform(
+            connectTestRelation.observe(Observation("my_metric"), "id".protoAttr.cast("string"))))
+      },
+      errorClass = "INVALID_OBSERVED_METRICS.NON_AGGREGATE_FUNC_ARG_IS_ATTRIBUTE",
+      parameters = Map("expr" -> "\"id AS id\""))
+  }
+
   test("Test RandomSplit") {
     val splitRelations0 = connectTestRelation.randomSplit(Array[Double](1, 2, 3), 1)
     val splits0 = sparkTestRelation.randomSplit(Array[Double](1, 2, 3), 1)
@@ -956,6 +1035,14 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
     }
   }
 
+  test("SPARK-47144: Collated string") {
+    Seq("UTF8_BINARY", "UTF8_BINARY_LCASE", "UNICODE", "UNICODE_CI").map(collationName =>
+      Seq(
+        s"select 'abc' collate $collationName",
+        s"select collation('abc' collate $collationName)").map(query =>
+        comparePlans(connect.sql(query), spark.sql(query))))
+  }
+
   private def createLocalRelationProtoByAttributeReferences(
       attrs: Seq[AttributeReference]): proto.Relation = {
     val localRelationBuilder = proto.LocalRelation.newBuilder()
@@ -964,10 +1051,11 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
     val buffer = ArrowConverters
       .toBatchWithSchemaIterator(
         Iterator.empty,
-        StructType.fromAttributes(attributes),
+        DataTypeUtils.fromAttributes(attributes),
         Long.MaxValue,
         Long.MaxValue,
-        null)
+        null,
+        true)
       .next()
     proto.Relation
       .newBuilder()
@@ -990,7 +1078,10 @@ class SparkConnectProtoSuite extends PlanTest with SparkConnectPlanTest {
 
   // Compares proto plan with LogicalPlan.
   private def comparePlans(connectPlan: proto.Relation, sparkPlan: LogicalPlan): Unit = {
+    def normalizeDataframeId(plan: LogicalPlan): LogicalPlan = plan transform {
+      case cm: CollectMetrics => cm.copy(dataframeId = 0)
+    }
     val connectAnalyzed = analyzePlan(transform(connectPlan))
-    comparePlans(connectAnalyzed, sparkPlan, false)
+    comparePlans(normalizeDataframeId(connectAnalyzed), normalizeDataframeId(sparkPlan), false)
   }
 }

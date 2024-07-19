@@ -16,21 +16,15 @@
 #
 import unittest
 
-from pyspark.sql.connect.readwriter import DataFrameWriterV2
 from pyspark.sql.tests.test_readwriter import ReadwriterTestsMixin, ReadwriterV2TestsMixin
-from pyspark.testing.connectutils import ReusedConnectTestCase
+from pyspark.testing.connectutils import should_test_connect, ReusedConnectTestCase
+
+if should_test_connect:
+    from pyspark.sql.connect.readwriter import DataFrameWriterV2
 
 
 class ReadwriterParityTests(ReadwriterTestsMixin, ReusedConnectTestCase):
-    # TODO(SPARK-41834): Implement SparkSession.conf
-    @unittest.skip("Fails in Spark Connect, should enable.")
-    def test_save_and_load(self):
-        super().test_save_and_load()
-
-    # TODO(SPARK-41834): Implement SparkSession.conf
-    @unittest.skip("Fails in Spark Connect, should enable.")
-    def test_save_and_load_builder(self):
-        super().test_save_and_load_builder()
+    pass
 
 
 class ReadwriterV2ParityTests(ReadwriterV2TestsMixin, ReusedConnectTestCase):

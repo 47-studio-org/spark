@@ -18,12 +18,11 @@ package org.apache.spark.sql
 
 import java.io.ByteArrayOutputStream
 
-import scala.collection.JavaConverters._
-
-import org.scalatest.funsuite.{AnyFunSuite => ConnectFunSuite} // scalastyle:ignore funsuite
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.sql.{functions => fn}
-import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.test.ConnectFunSuite
+import org.apache.spark.sql.types._
 
 /**
  * Tests for client local Column behavior.
@@ -177,4 +176,37 @@ class ColumnTestSuite extends ConnectFunSuite {
       assert(explain1.contains(fragment))
     }
   }
+
+  private def testColName(dataType: DataType, f: ColumnName => StructField): Unit = {
+    test("ColumnName " + dataType.catalogString) {
+      val actual = f(new ColumnName("col"))
+      val expected = StructField("col", dataType)
+      assert(actual === expected)
+    }
+  }
+
+  testColName(BooleanType, _.boolean)
+  testColName(ByteType, _.byte)
+  testColName(ShortType, _.short)
+  testColName(IntegerType, _.int)
+  testColName(LongType, _.long)
+  testColName(FloatType, _.float)
+  testColName(DoubleType, _.double)
+  testColName(DecimalType.USER_DEFAULT, _.decimal)
+  testColName(DecimalType(20, 10), _.decimal(20, 10))
+  testColName(DateType, _.date)
+  testColName(TimestampType, _.timestamp)
+  testColName(StringType, _.string)
+  testColName(BinaryType, _.binary)
+  testColName(ArrayType(IntegerType), _.array(IntegerType))
+
+  private val mapType = MapType(StringType, StringType)
+  testColName(mapType, _.map(mapType))
+  testColName(MapType(StringType, IntegerType), _.map(StringType, IntegerType))
+
+  private val structType1 = new StructType().add("a", "int").add("b", "string")
+  private val structType2 = structType1.add("c", "binary")
+  testColName(structType1, _.struct(structType1))
+  import org.apache.spark.util.ArrayImplicits._
+  testColName(structType2, _.struct(structType2.fields.toImmutableArraySeq: _*))
 }

@@ -29,16 +29,18 @@ import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow, TableIden
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.aggregate.{Final, Partial}
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, Limit, LocalRelation, LogicalPlan, Statistics, UnresolvedHint}
-import org.apache.spark.sql.catalyst.plans.physical.Partitioning
+import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec, ShuffleQueryStageExec}
-import org.apache.spark.sql.execution.datasources.{FileFormat, WriteFilesExec, WriteFilesSpec}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AdaptiveSparkPlanHelper, AQEShuffleReadExec, QueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.datasources.{FileFormat, WriteFilesExec, WriteFilesExecBase, WriteFilesSpec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, BroadcastExchangeLike, ShuffleExchangeExec, ShuffleExchangeLike, ShuffleOrigin}
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
 import org.apache.spark.sql.internal.SQLConf
@@ -51,7 +53,7 @@ import org.apache.spark.unsafe.types.UTF8String
 /**
  * Test cases for the [[SparkSessionExtensions]].
  */
-class SparkSessionExtensionSuite extends SparkFunSuite with SQLHelper {
+class SparkSessionExtensionSuite extends SparkFunSuite with SQLHelper with AdaptiveSparkPlanHelper {
   private def create(
       builder: SparkSessionExtensionsProvider): Seq[SparkSessionExtensionsProvider] = Seq(builder)
 
@@ -206,7 +208,7 @@ class SparkSessionExtensionSuite extends SparkFunSuite with SQLHelper {
       import session.implicits._
       val df = Seq((1, "a"), (2, "b")).toDF("i", "s")
       df.select("i").filter($"i" > 1).cache()
-      assert(df.filter($"i" > 1).select("i").queryExecution.executedPlan.find {
+      assert(find(df.filter($"i" > 1).select("i").queryExecution.executedPlan) {
         case _: org.apache.spark.sql.execution.columnar.InMemoryTableScanExec => true
         case _ => false
       }.isDefined)
@@ -497,6 +499,47 @@ class SparkSessionExtensionSuite extends SparkFunSuite with SQLHelper {
         assert(!executedPlan(df).isInstanceOf[CollectLimitExec])
         df.collect()
         assert(executedPlan(df).isInstanceOf[CollectLimitExec])
+      }
+    }
+  }
+
+  test("SPARK-42963: Extend SparkSessionExtensions to inject rules into AQE query stage " +
+    "optimizer") {
+    val extensions = create { extensions =>
+      extensions.injectQueryStageOptimizerRule(_ => RequireAtLeaseTwoPartitions)
+    }
+    withSession(extensions) { session =>
+      assert(session.sessionState.adaptiveRulesHolder.queryStageOptimizerRules
+        .contains(RequireAtLeaseTwoPartitions))
+      withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "3") {
+        val df = session.range(1).repartition()
+        df.collect()
+        assert(df.rdd.partitions.length == 3)
+      }
+    }
+  }
+
+  test("SPARK-46170: Support inject adaptive query post planner strategy rules in " +
+    "SparkSessionExtensions") {
+    val extensions = create { extensions =>
+      extensions.injectQueryPostPlannerStrategyRule(_ => MyQueryPostPlannerStrategyRule)
+    }
+    withSession(extensions) { session =>
+      assert(session.sessionState.adaptiveRulesHolder.queryPostPlannerStrategyRules
+        .contains(MyQueryPostPlannerStrategyRule))
+      import session.implicits._
+      withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "3",
+          SQLConf.COALESCE_PARTITIONS_ENABLED.key -> "false") {
+        val input = Seq(10, 20, 10).toDF("c1")
+        val df = input.groupBy("c1").count()
+        df.collect()
+        assert(df.rdd.partitions.length == 1)
+        assert(collectFirst(df.queryExecution.executedPlan) {
+          case s: ShuffleExchangeExec if s.outputPartitioning == SinglePartition => true
+        }.isDefined)
+        assert(collectFirst(df.queryExecution.executedPlan) {
+          case _: SortExec => true
+        }.isDefined)
       }
     }
   }
@@ -799,24 +842,23 @@ class ColumnarProjectExec(projectList: Seq[NamedExpression], child: SparkPlan)
     new ColumnarProjectExec(projectList, newChild)
 }
 
-class ColumnarWriteExec(
+case class ColumnarWriteExec(
     child: SparkPlan,
     fileFormat: FileFormat,
     partitionColumns: Seq[Attribute],
     bucketSpec: Option[BucketSpec],
     options: Map[String, String],
-    staticPartitions: TablePartitionSpec) extends WriteFilesExec(
-  child, fileFormat, partitionColumns, bucketSpec, options, staticPartitions) {
+    staticPartitions: TablePartitionSpec) extends WriteFilesExecBase {
 
-  override def supportsColumnar(): Boolean = true
+  override def supportsColumnar: Boolean = true
 
   override def doExecuteWrite(writeFilesSpec: WriteFilesSpec): RDD[WriterCommitMessage] = {
     assert(child.supportsColumnar)
     throw new Exception("columnar write")
   }
 
-  override protected def withNewChildInternal(newChild: SparkPlan): WriteFilesExec =
-    new ColumnarWriteExec(
+  override protected def withNewChildInternal(newChild: SparkPlan): ColumnarWriteExec =
+    ColumnarWriteExec(
       newChild, fileFormat, partitionColumns, bucketSpec, options, staticPartitions)
 }
 
@@ -830,7 +872,7 @@ class BrokenColumnarAdd(
     failOnError: Boolean = false)
   extends Add(left, right, EvalMode.fromBoolean(failOnError)) with ColumnarExpression {
 
-  override def supportsColumnar(): Boolean = left.supportsColumnar && right.supportsColumnar
+  override def supportsColumnar: Boolean = left.supportsColumnar && right.supportsColumnar
 
   override def columnarEval(batch: ColumnarBatch): Any = {
     var lhs: Any = null
@@ -928,7 +970,7 @@ case class PreRuleReplaceAddWithBrokenVersion() extends Rule[SparkPlan] {
             replaceWithColumnarExpression(exp).asInstanceOf[NamedExpression]),
             replaceWithColumnarPlan(plan.child))
         case write: WriteFilesExec =>
-          new ColumnarWriteExec(
+          ColumnarWriteExec(
             replaceWithColumnarPlan(write.child),
             write.fileFormat,
             write.partitionColumns,
@@ -956,6 +998,7 @@ case class PreRuleReplaceAddWithBrokenVersion() extends Rule[SparkPlan] {
 case class MyShuffleExchangeExec(delegate: ShuffleExchangeExec) extends ShuffleExchangeLike {
   override def numMappers: Int = delegate.numMappers
   override def numPartitions: Int = delegate.numPartitions
+  override def advisoryPartitionSize: Option[Long] = delegate.advisoryPartitionSize
   override def shuffleOrigin: ShuffleOrigin = {
     delegate.shuffleOrigin
   }
@@ -970,6 +1013,7 @@ case class MyShuffleExchangeExec(delegate: ShuffleExchangeExec) extends ShuffleE
     val attributeStats = AttributeMap(Seq((child.output.head, columnStats)))
     Statistics(stats.sizeInBytes, stats.rowCount, attributeStats)
   }
+  override def shuffleId: Int = delegate.shuffleId
   override def child: SparkPlan = delegate.child
   override protected def doExecute(): RDD[InternalRow] = delegate.execute()
   override def outputPartitioning: Partitioning = delegate.outputPartitioning
@@ -982,7 +1026,7 @@ case class MyShuffleExchangeExec(delegate: ShuffleExchangeExec) extends ShuffleE
  * whether AQE is enabled.
  */
 case class MyBroadcastExchangeExec(delegate: BroadcastExchangeExec) extends BroadcastExchangeLike {
-  override def runId: UUID = delegate.runId
+  override val runId: UUID = delegate.runId
   override def relationFuture: java.util.concurrent.Future[Broadcast[Any]] =
     delegate.relationFuture
   override def completionFuture: Future[Broadcast[Any]] = delegate.submitBroadcastJob
@@ -1158,5 +1202,29 @@ object AddLimit extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan = plan match {
     case Limit(_, _) => plan
     case _ => Limit(Literal(1), plan)
+  }
+}
+
+object RequireAtLeaseTwoPartitions extends Rule[SparkPlan] {
+  override def apply(plan: SparkPlan): SparkPlan = {
+    val readOpt = plan.find(_.isInstanceOf[AQEShuffleReadExec])
+    if (readOpt.exists(_.outputPartitioning.numPartitions == 1)) {
+      plan.transform {
+        case read: AQEShuffleReadExec => read.child
+      }
+    } else {
+      plan
+    }
+  }
+}
+
+object MyQueryPostPlannerStrategyRule extends Rule[SparkPlan] {
+  override def apply(plan: SparkPlan): SparkPlan = {
+    plan.transformUp {
+      case h: HashAggregateExec if h.aggregateExpressions.map(_.mode).contains(Partial) =>
+        ShuffleExchangeExec(SinglePartition, h)
+      case h: HashAggregateExec if h.aggregateExpressions.map(_.mode).contains(Final) =>
+        SortExec(h.groupingExpressions.map(k => SortOrder.apply(k, Ascending)), false, h)
+    }
   }
 }

@@ -24,6 +24,7 @@ package spark.connect;
 
 option java_multiple_files = true;
 option java_package = "org.apache.spark.connect.proto";
+option go_package = "internal/generated";
 
 // Expression used to refer to fields, functions and similar. This can be used everywhere
 // expressions in SQL appear.
@@ -45,6 +46,8 @@ message Expression {
     UpdateFields update_fields = 13;
     UnresolvedNamedLambdaVariable unresolved_named_lambda_variable = 14;
     CommonInlineUserDefinedFunction common_inline_user_defined_function = 15;
+    CallFunction call_function = 16;
+    NamedArgumentExpression named_argument_expression = 17;
 
     // This field is used to mark extensions to the protocol. When plugins generate arbitrary
     // relations they can add them here. During the planning the correct resolution is done.
@@ -144,6 +147,16 @@ message Expression {
       // If this is set, Server will use Catalyst parser to parse this string to DataType.
       string type_str = 3;
     }
+
+    // (Optional) The expression evaluation mode.
+    EvalMode eval_mode = 4;
+
+    enum EvalMode {
+      EVAL_MODE_UNSPECIFIED = 0;
+      EVAL_MODE_LEGACY = 1;
+      EVAL_MODE_ANSI = 2;
+      EVAL_MODE_TRY = 3;
+    }
   }
 
   message Literal {
@@ -172,6 +185,9 @@ message Expression {
       CalendarInterval calendar_interval = 19;
       int32 year_month_interval = 20;
       int64 day_time_interval = 21;
+      Array array = 22;
+      Map map = 23;
+      Struct struct = 24;
     }
 
     message Decimal {
@@ -189,6 +205,23 @@ message Expression {
       int32 days = 2;
       int64 microseconds = 3;
     }
+
+    message Array {
+      DataType element_type = 1;
+      repeated Literal elements = 2;
+    }
+
+    message Map {
+      DataType key_type = 1;
+      DataType value_type = 2;
+      repeated Literal keys = 3;
+      repeated Literal values = 4;
+    }
+
+    message Struct {
+      DataType struct_type = 1;
+      repeated Literal elements = 2;
+    }
   }
 
   // An unresolved attribute that is not explicitly bound to a specific column, but the column
@@ -200,6 +233,9 @@ message Expression {
 
     // (Optional) The id of corresponding connect plan.
     optional int64 plan_id = 2;
+
+    // (Optional) The requested column is a metadata column.
+    optional bool is_metadata_column = 3;
   }
 
   // An unresolved function is not explicitly bound to one explicit function, but the function
@@ -235,6 +271,9 @@ message Expression {
     // If set, it should end with '.*' and will be parsed by 'parseAttributeName'
     // in the server side.
     optional string unparsed_target = 1;
+
+    // (Optional) The id of corresponding connect plan.
+    optional int64 plan_id = 2;
   }
 
   // Represents all of the input attributes to a given relational operator, for example in
@@ -242,6 +281,9 @@ message Expression {
   message UnresolvedRegex {
     // (Required) The column name used to extract column with regex.
     string col_name = 1;
+
+    // (Optional) The id of corresponding connect plan.
+    optional int64 plan_id = 2;
   }
 
   // Extracts a value or values from an Expression
@@ -303,7 +345,7 @@ message Expression {
 message CommonInlineUserDefinedFunction {
   // (Required) Name of the user-defined function.
   string function_name = 1;
-  // (Required) Indicate if the user-defined function is deterministic.
+  // (Optional) Indicate if the user-defined function is deterministic.
   bool deterministic = 2;
   // (Optional) Function arguments. Empty arguments are allowed.
   repeated Expression arguments = 3;
@@ -311,12 +353,13 @@ message CommonInlineUserDefinedFunction {
   oneof function {
     PythonUDF python_udf = 4;
     ScalarScalaUDF scalar_scala_udf = 5;
+    JavaUDF java_udf = 6;
   }
 }
 
 message PythonUDF {
   // (Required) Output type of the Python UDF
-  string output_type = 1;
+  DataType output_type = 1;
   // (Required) EvalType of the Python UDF
   int32 eval_type = 2;
   // (Required) The encoded commands of the Python UDF
@@ -334,5 +377,33 @@ message ScalarScalaUDF {
   DataType outputType = 3;
   // (Required) True if the UDF can return null value
   bool nullable = 4;
+  // (Required) Indicate if the UDF is an aggregate function
+  bool aggregate = 5;
 }
 
+message JavaUDF {
+  // (Required) Fully qualified name of Java class
+  string class_name = 1;
+
+  // (Optional) Output type of the Java UDF
+  optional DataType output_type = 2;
+
+  // (Required) Indicate if the Java user-defined function is an aggregate function
+  bool aggregate = 3;
+}
+
+message CallFunction {
+  // (Required) Unparsed name of the SQL function.
+  string function_name = 1;
+
+  // (Optional) Function arguments. Empty arguments are allowed.
+  repeated Expression arguments = 2;
+}
+
+message NamedArgumentExpression {
+  // (Required) The key of the named argument.
+  string key = 1;
+
+  // (Required) The value expression of the named argument.
+  Expression value = 2;
+}

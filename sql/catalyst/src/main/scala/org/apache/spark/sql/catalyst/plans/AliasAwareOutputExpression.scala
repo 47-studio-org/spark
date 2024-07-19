@@ -40,6 +40,7 @@ trait AliasAwareOutputExpression extends SQLConfHelper {
   // more than `aliasCandidateLimit` attributes for an expression. In those cases the old logic
   // handled only the last alias so we need to make sure that we give precedence to that.
   // If the `outputExpressions` contain simple attributes we need to add those too to the map.
+  @transient
   private lazy val aliasMap = {
     val aliases = mutable.Map[Expression, mutable.ArrayBuffer[Attribute]]()
     outputExpressions.reverse.foreach {
@@ -66,7 +67,7 @@ trait AliasAwareOutputExpression extends SQLConfHelper {
   /**
    * Return a stream of expressions in which the original expression is projected with `aliasMap`.
    */
-  protected def projectExpression(expr: Expression): Stream[Expression] = {
+  protected def projectExpression(expr: Expression): LazyList[Expression] = {
     val outputSet = AttributeSet(outputExpressions.map(_.toAttribute))
     expr.multiTransformDown {
       // Mapping with aliases
@@ -95,14 +96,14 @@ trait AliasAwareQueryOutputOrdering[T <: QueryPlan[T]]
   }
 
   override final def outputOrdering: Seq[SortOrder] = {
-    if (hasAlias) {
+    val newOrdering: Iterator[Option[SortOrder]] = if (hasAlias) {
       // Take the first `SortOrder`s only until they can be projected.
       // E.g. we have child ordering `Seq(SortOrder(a), SortOrder(b))` then
       // if only `a AS x` can be projected then we can return Seq(SortOrder(x))`
       // but if only `b AS y` can be projected we can't return `Seq(SortOrder(y))`.
       orderingExpressions.iterator.map { sortOrder =>
         val orderingSet = mutable.Set.empty[Expression]
-        val sameOrderings = sortOrder.children.toStream
+        val sameOrderings = sortOrder.children.to(LazyList)
           .flatMap(projectExpression)
           .filter(e => orderingSet.add(e.canonicalized))
           .take(aliasCandidateLimit)
@@ -112,9 +113,21 @@ trait AliasAwareQueryOutputOrdering[T <: QueryPlan[T]]
         } else {
           None
         }
-      }.takeWhile(_.isDefined).flatten.toSeq
+      }
     } else {
-      orderingExpressions
+      // Make sure the returned ordering are valid (only reference output attributes of the current
+      // plan node). Same as above (the if branch), we take the first ordering expressions that are
+      // all valid.
+      val outputSet = AttributeSet(outputExpressions.map(_.toAttribute))
+      orderingExpressions.iterator.map { order =>
+        val validChildren = order.children.filter(_.references.subsetOf(outputSet))
+        if (validChildren.nonEmpty) {
+          Some(order.copy(child = validChildren.head, sameOrderExpressions = validChildren.tail))
+        } else {
+          None
+        }
+      }
     }
+    newOrdering.takeWhile(_.isDefined).flatten.toSeq
   }
 }

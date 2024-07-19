@@ -17,9 +17,9 @@
 
 package org.apache.spark.sql
 
-import java.util.Locale
+import java.util.{Locale, Properties}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.annotation.Stable
 import org.apache.spark.connect.proto
@@ -228,7 +228,9 @@ final class DataFrameWriter[T] private[sql] (ds: Dataset[T]) {
 
     // Set path or table
     f(builder)
-    require(builder.hasPath != builder.hasTable) // Only one can be set
+
+    // Cannot both be set
+    require(!(builder.hasPath && builder.hasTable))
 
     builder.setMode(mode match {
       case SaveMode.Append => proto.WriteOperation.SaveMode.SAVE_MODE_APPEND
@@ -252,7 +254,7 @@ final class DataFrameWriter[T] private[sql] (ds: Dataset[T]) {
       builder.putOptions(k, v)
     }
 
-    ds.session.execute(proto.Command.newBuilder().setWriteOperation(builder).build())
+    ds.sparkSession.execute(proto.Command.newBuilder().setWriteOperation(builder).build())
   }
 
   /**
@@ -346,6 +348,37 @@ final class DataFrameWriter[T] private[sql] (ds: Dataset[T]) {
   }
 
   /**
+   * Saves the content of the `DataFrame` to an external database table via JDBC. In the case the
+   * table already exists in the external database, behavior of this function depends on the save
+   * mode, specified by the `mode` function (default to throwing an exception).
+   *
+   * Don't create too many partitions in parallel on a large cluster; otherwise Spark might crash
+   * your external database systems.
+   *
+   * JDBC-specific option and parameter documentation for storing tables via JDBC in <a
+   * href="https://spark.apache.org/docs/latest/sql-data-sources-jdbc.html#data-source-option">
+   * Data Source Option</a> in the version you use.
+   *
+   * @param table
+   *   Name of the table in the external database.
+   * @param connectionProperties
+   *   JDBC database connection arguments, a list of arbitrary string tag/value. Normally at least
+   *   a "user" and "password" property should be included. "batchsize" can be used to control the
+   *   number of rows per insert. "isolationLevel" can be one of "NONE", "READ_COMMITTED",
+   *   "READ_UNCOMMITTED", "REPEATABLE_READ", or "SERIALIZABLE", corresponding to standard
+   *   transaction isolation levels defined by JDBC's Connection object, with default of
+   *   "READ_UNCOMMITTED".
+   * @since 3.4.0
+   */
+  def jdbc(url: String, table: String, connectionProperties: Properties): Unit = {
+    // connectionProperties should override settings in extraOptions.
+    this.extraOptions ++= connectionProperties.asScala
+    // explicit url and dbtable should override all
+    this.extraOptions ++= Seq("url" -> url, "dbtable" -> table)
+    format("jdbc").save()
+  }
+
+  /**
    * Saves the content of the `DataFrame` in JSON format (<a href="http://jsonlines.org/"> JSON
    * Lines text format or newline-delimited JSON</a>) at the specified path. This is equivalent
    * to:
@@ -435,6 +468,34 @@ final class DataFrameWriter[T] private[sql] (ds: Dataset[T]) {
    */
   def csv(path: String): Unit = {
     format("csv").save(path)
+  }
+
+  /**
+   * Saves the content of the `DataFrame` in XML format at the specified path. This is equivalent
+   * to:
+   * {{{
+   *   format("xml").save(path)
+   * }}}
+   *
+   * Note that writing a XML file from `DataFrame` having a field `ArrayType` with its element as
+   * `ArrayType` would have an additional nested field for the element. For example, the
+   * `DataFrame` having a field below,
+   *
+   * {@code fieldA [[data1], [data2]]}
+   *
+   * would produce a XML file below. { @code <fieldA> <item>data1</item> </fieldA> <fieldA>
+   * <item>data2</item> </fieldA>}
+   *
+   * Namely, roundtrip in writing and reading can end up in different schema structure.
+   *
+   * You can find the XML-specific options for writing XML files in <a
+   * href="https://spark.apache.org/docs/latest/sql-data-sources-xml.html#data-source-option">
+   * Data Source Option</a> in the version you use.
+   *
+   * @since 4.0.0
+   */
+  def xml(path: String): Unit = {
+    format("xml").save(path)
   }
 
   ///////////////////////////////////////////////////////////////////////////////////////

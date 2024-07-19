@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.TimestampNTZType
+import org.apache.spark.util.Utils
 
 /**
  * Options for the JDBC data source.
@@ -62,7 +63,8 @@ class JDBCOptions(
    */
   val asConnectionProperties: Properties = {
     val properties = new Properties()
-    parameters.originalMap.filterKeys(key => !jdbcOptionNames(key.toLowerCase(Locale.ROOT)))
+    parameters.originalMap
+      .filter { case (key, _) => !jdbcOptionNames(key.toLowerCase(Locale.ROOT)) }
       .foreach { case (k, v) => properties.setProperty(k, v) }
     properties
   }
@@ -192,19 +194,19 @@ class JDBCOptions(
 
   // An option to allow/disallow pushing down aggregate into JDBC data source
   // This only applies to Data Source V2 JDBC
-  val pushDownAggregate = parameters.getOrElse(JDBC_PUSHDOWN_AGGREGATE, "false").toBoolean
+  val pushDownAggregate = parameters.getOrElse(JDBC_PUSHDOWN_AGGREGATE, "true").toBoolean
 
   // An option to allow/disallow pushing down LIMIT into V2 JDBC data source
   // This only applies to Data Source V2 JDBC
-  val pushDownLimit = parameters.getOrElse(JDBC_PUSHDOWN_LIMIT, "false").toBoolean
+  val pushDownLimit = parameters.getOrElse(JDBC_PUSHDOWN_LIMIT, "true").toBoolean
 
   // An option to allow/disallow pushing down OFFSET into V2 JDBC data source
   // This only applies to Data Source V2 JDBC
-  val pushDownOffset = parameters.getOrElse(JDBC_PUSHDOWN_OFFSET, "false").toBoolean
+  val pushDownOffset = parameters.getOrElse(JDBC_PUSHDOWN_OFFSET, "true").toBoolean
 
   // An option to allow/disallow pushing down TABLESAMPLE into JDBC data source
   // This only applies to Data Source V2 JDBC
-  val pushDownTableSample = parameters.getOrElse(JDBC_PUSHDOWN_TABLESAMPLE, "false").toBoolean
+  val pushDownTableSample = parameters.getOrElse(JDBC_PUSHDOWN_TABLESAMPLE, "true").toBoolean
 
   // The local path of user's keytab file, which is assumed to be pre-uploaded to all nodes either
   // by --files option of spark-submit or manually
@@ -239,6 +241,16 @@ class JDBCOptions(
       .get(JDBC_PREFER_TIMESTAMP_NTZ)
       .map(_.toBoolean)
       .getOrElse(SQLConf.get.timestampType == TimestampNTZType)
+
+  override def hashCode: Int = this.parameters.hashCode()
+
+  override def equals(other: Any): Boolean = other match {
+    case otherOption: JDBCOptions =>
+      otherOption.parameters.equals(this.parameters)
+    case _ => false
+  }
+
+  def getRedactUrl(): String = Utils.redact(SQLConf.get.stringRedactionPattern, url)
 }
 
 class JdbcOptionsInWrite(

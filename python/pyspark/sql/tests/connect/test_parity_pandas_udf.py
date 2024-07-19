@@ -15,45 +15,12 @@
 # limitations under the License.
 #
 
-import unittest
-
 from pyspark.sql.tests.pandas.test_pandas_udf import PandasUDFTestsMixin
 from pyspark.testing.connectutils import ReusedConnectTestCase
 
 
 class PandasUDFParityTests(PandasUDFTestsMixin, ReusedConnectTestCase):
-    @unittest.skip(
-        "Spark Connect does not support sc._jvm.org.apache.log4j but the test depends on it."
-    )
-    def test_udf_wrong_arg(self):
-        super().test_udf_wrong_arg()
-
-    @unittest.skip("Spark Connect does not support spark.conf but the test depends on it.")
-    def test_pandas_udf_timestamp_ntz(self):
-        super().test_pandas_udf_timestamp_ntz()
-
-    @unittest.skip("Spark Connect does not support spark.conf but the test depends on it.")
-    def test_pandas_udf_detect_unsafe_type_conversion(self):
-        super().test_pandas_udf_detect_unsafe_type_conversion()
-
-    @unittest.skip("Spark Connect does not support spark.conf but the test depends on it.")
-    def test_pandas_udf_arrow_overflow(self):
-        super().test_pandas_udf_arrow_overflow()
-
-    # TODO(SPARK-42247): standardize `returnType` attribute of UDF
-    @unittest.skip("Fails in Spark Connect, should enable.")
-    def test_pandas_udf_decorator(self):
-        super().test_pandas_udf_decorator()
-
-    # TODO(SPARK-42247): standardize `returnType` attribute of UDF
-    @unittest.skip("Fails in Spark Connect, should enable.")
-    def test_pandas_udf_basic(self):
-        super().test_pandas_udf_basic()
-
-    # TODO(SPARK-42340): implement GroupedData.applyInPandas
-    @unittest.skip("Fails in Spark Connect, should enable.")
-    def test_stopiteration_in_grouped_map(self):
-        super().test_stopiteration_in_grouped_map()
+    pass
 
 
 if __name__ == "__main__":

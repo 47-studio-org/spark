@@ -17,11 +17,14 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, PartitioningCollection, UnknownPartitioning}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, PartitioningCollection, UnknownPartitioning}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.StringType
 
 class ProjectedOrderingAndPartitioningSuite
   extends SharedSparkSession with AdaptiveSparkPlanHelper {
@@ -101,6 +104,22 @@ class ProjectedOrderingAndPartitioningSuite
     }
   }
 
+  test("SPARK-46609: Avoid exponential explosion in PartitioningPreservingUnaryExecNode") {
+    withSQLConf(SQLConf.EXPRESSION_PROJECTION_CANDIDATE_LIMIT.key -> "2") {
+      val output = Seq(AttributeReference("a", StringType)(), AttributeReference("b", StringType)())
+      val plan = ProjectExec(
+        Seq(
+          Alias(output(0), "a1")(),
+          Alias(output(0), "a2")(),
+          Alias(output(1), "b1")(),
+          Alias(output(1), "b2")()
+        ),
+        DummyLeafPlanExec(output)
+      )
+      assert(plan.outputPartitioning.asInstanceOf[PartitioningCollection].partitionings.length == 2)
+    }
+  }
+
   test("SPARK-42049: Improve AliasAwareOutputExpression - multi-references to complex " +
     "expressions") {
     val df2 = spark.range(2).repartition($"id" + $"id").selectExpr("id + id as a", "id + id as b")
@@ -176,5 +195,26 @@ class ProjectedOrderingAndPartitioningSuite
     val df3 = df.selectExpr("id + 2 AS b")
     val outputOrdering3 = df3.queryExecution.optimizedPlan.outputOrdering
     assert(outputOrdering3.size == 0)
+  }
+
+  test("SPARK-42049: Improve AliasAwareOutputExpression - no alias but still prune expressions") {
+    val df = spark.range(2).select($"id" + 1 as "a", $"id" + 2 as "b")
+
+    val df1 = df.repartition($"a", $"b").selectExpr("a")
+    val outputPartitioning = stripAQEPlan(df1.queryExecution.executedPlan).outputPartitioning
+    assert(outputPartitioning.isInstanceOf[UnknownPartitioning])
+
+    val df2 = df.orderBy("a", "b").select("a")
+    val outputOrdering = df2.queryExecution.optimizedPlan.outputOrdering
+    assert(outputOrdering.size == 1)
+    assert(outputOrdering.head.child.asInstanceOf[Attribute].name == "a")
+    assert(outputOrdering.head.sameOrderExpressions.size == 0)
+  }
+}
+
+private case class DummyLeafPlanExec(output: Seq[Attribute]) extends LeafExecNode {
+  override protected def doExecute(): RDD[InternalRow] = null
+  override def outputPartitioning: Partitioning = {
+    PartitioningCollection(output.map(attr => HashPartitioning(Seq(attr), 4)))
   }
 }

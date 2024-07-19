@@ -16,10 +16,10 @@
 #
 from pyspark.sql.connect.utils import check_dependencies
 
-check_dependencies(__name__, __file__)
+check_dependencies(__name__)
 
 from typing import Dict
-from typing import Optional, Union, List, overload, Tuple, cast, Any
+from typing import Optional, Union, List, overload, Tuple, cast
 from typing import TYPE_CHECKING
 
 from pyspark.sql.connect.plan import Read, DataSource, LogicalPlan, WriteOperation, WriteOperationV2
@@ -30,6 +30,8 @@ from pyspark.sql.readwriter import (
     DataFrameReader as PySparkDataFrameReader,
     DataFrameWriterV2 as PySparkDataFrameWriterV2,
 )
+from pyspark.errors import PySparkAttributeError, PySparkTypeError, PySparkValueError
+from pyspark.sql.connect.functions import builtin as F
 
 if TYPE_CHECKING:
     from pyspark.sql.connect.dataframe import DataFrame
@@ -63,7 +65,7 @@ class DataFrameReader(OptionUtils):
 
     def __init__(self, client: "SparkSession"):
         self._client = client
-        self._format = ""
+        self._format: Optional[str] = None
         self._schema = ""
         self._options: Dict[str, str] = {}
 
@@ -79,7 +81,13 @@ class DataFrameReader(OptionUtils):
         elif isinstance(schema, str):
             self._schema = schema
         else:
-            raise TypeError(f"schema must be a StructType or str, but got {schema}")
+            raise PySparkTypeError(
+                error_class="NOT_STR_OR_STRUCT",
+                message_parameters={
+                    "arg_name": "schema",
+                    "arg_type": type(schema).__name__,
+                },
+            )
         return self
 
     schema.__doc__ = PySparkDataFrameReader.schema.__doc__
@@ -127,10 +135,10 @@ class DataFrameReader(OptionUtils):
     def _df(self, plan: LogicalPlan) -> "DataFrame":
         from pyspark.sql.connect.dataframe import DataFrame
 
-        return DataFrame.withPlan(plan, self._client)
+        return DataFrame(plan, self._client)
 
     def table(self, tableName: str) -> "DataFrame":
-        return self._df(Read(tableName))
+        return self._df(Read(tableName, self._options))
 
     table.__doc__ = PySparkDataFrameReader.table.__doc__
 
@@ -317,6 +325,56 @@ class DataFrameReader(OptionUtils):
 
     csv.__doc__ = PySparkDataFrameReader.csv.__doc__
 
+    def xml(
+        self,
+        path: PathOrPaths,
+        rowTag: Optional[str] = None,
+        schema: Optional[Union[StructType, str]] = None,
+        excludeAttribute: Optional[Union[bool, str]] = None,
+        attributePrefix: Optional[str] = None,
+        valueTag: Optional[str] = None,
+        ignoreSurroundingSpaces: Optional[Union[bool, str]] = None,
+        rowValidationXSDPath: Optional[str] = None,
+        ignoreNamespace: Optional[Union[bool, str]] = None,
+        wildcardColName: Optional[str] = None,
+        encoding: Optional[str] = None,
+        inferSchema: Optional[Union[bool, str]] = None,
+        nullValue: Optional[str] = None,
+        dateFormat: Optional[str] = None,
+        timestampFormat: Optional[str] = None,
+        mode: Optional[str] = None,
+        columnNameOfCorruptRecord: Optional[str] = None,
+        multiLine: Optional[Union[bool, str]] = None,
+        samplingRatio: Optional[Union[float, str]] = None,
+        locale: Optional[str] = None,
+    ) -> "DataFrame":
+        self._set_opts(
+            rowTag=rowTag,
+            schema=schema,
+            excludeAttribute=excludeAttribute,
+            attributePrefix=attributePrefix,
+            valueTag=valueTag,
+            ignoreSurroundingSpaces=ignoreSurroundingSpaces,
+            rowValidationXSDPath=rowValidationXSDPath,
+            ignoreNamespace=ignoreNamespace,
+            wildcardColName=wildcardColName,
+            encoding=encoding,
+            inferSchema=inferSchema,
+            nullValue=nullValue,
+            dateFormat=dateFormat,
+            timestampFormat=timestampFormat,
+            mode=mode,
+            columnNameOfCorruptRecord=columnNameOfCorruptRecord,
+            multiLine=multiLine,
+            samplingRatio=samplingRatio,
+            locale=locale,
+        )
+        if isinstance(path, str):
+            path = [path]
+        return self.load(path=path, format="xml", schema=schema)
+
+    xml.__doc__ = PySparkDataFrameReader.xml.__doc__
+
     def orc(
         self,
         path: PathOrPaths,
@@ -339,8 +397,89 @@ class DataFrameReader(OptionUtils):
 
     orc.__doc__ = PySparkDataFrameReader.orc.__doc__
 
-    def jdbc(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError("jdbc() not supported for DataFrameWriter")
+    @overload
+    def jdbc(
+        self, url: str, table: str, *, properties: Optional[Dict[str, str]] = None
+    ) -> "DataFrame":
+        ...
+
+    @overload
+    def jdbc(
+        self,
+        url: str,
+        table: str,
+        column: str,
+        lowerBound: Union[int, str],
+        upperBound: Union[int, str],
+        numPartitions: int,
+        *,
+        properties: Optional[Dict[str, str]] = None,
+    ) -> "DataFrame":
+        ...
+
+    @overload
+    def jdbc(
+        self,
+        url: str,
+        table: str,
+        *,
+        predicates: List[str],
+        properties: Optional[Dict[str, str]] = None,
+    ) -> "DataFrame":
+        ...
+
+    def jdbc(
+        self,
+        url: str,
+        table: str,
+        column: Optional[str] = None,
+        lowerBound: Optional[Union[int, str]] = None,
+        upperBound: Optional[Union[int, str]] = None,
+        numPartitions: Optional[int] = None,
+        predicates: Optional[List[str]] = None,
+        properties: Optional[Dict[str, str]] = None,
+    ) -> "DataFrame":
+        if properties is None:
+            properties = dict()
+
+        self.format("jdbc")
+
+        if column is not None:
+            assert lowerBound is not None, "lowerBound can not be None when ``column`` is specified"
+            assert upperBound is not None, "upperBound can not be None when ``column`` is specified"
+            assert (
+                numPartitions is not None
+            ), "numPartitions can not be None when ``column`` is specified"
+            self.options(
+                partitionColumn=column,
+                lowerBound=lowerBound,
+                upperBound=upperBound,
+                numPartitions=numPartitions,
+            )
+            self.options(**properties)
+            self.options(url=url, dbtable=table)
+            return self.load()
+        else:
+            self.options(**properties)
+            self.options(url=url, dbtable=table)
+            if predicates is not None:
+                plan = DataSource(
+                    format=self._format,
+                    schema=self._schema,
+                    options=self._options,
+                    predicates=predicates,
+                )
+                return self._df(plan)
+            else:
+                return self.load()
+
+    jdbc.__doc__ = PySparkDataFrameReader.jdbc.__doc__
+
+    @property
+    def _jreader(self) -> None:
+        raise PySparkAttributeError(
+            error_class="JVM_ATTRIBUTE_NOT_SUPPORTED", message_parameters={"attr_name": "_jreader"}
+        )
 
 
 DataFrameReader.__doc__ = PySparkDataFrameReader.__doc__
@@ -409,16 +548,41 @@ class DataFrameWriter(OptionUtils):
         self, numBuckets: int, col: Union[str, TupleOrListOfString], *cols: Optional[str]
     ) -> "DataFrameWriter":
         if not isinstance(numBuckets, int):
-            raise TypeError("numBuckets should be an int, got {0}.".format(type(numBuckets)))
+            raise PySparkValueError(
+                error_class="CANNOT_SET_TOGETHER",
+                message_parameters={
+                    "arg_list": f"`col` of type {type(col).__name__} and `cols`",
+                },
+            )
 
         if isinstance(col, (list, tuple)):
             if cols:
-                raise ValueError("col is a {0} but cols are not empty".format(type(col)))
+                raise PySparkValueError(
+                    error_class="NOT_INT",
+                    message_parameters={
+                        "arg_list": "numBuckets",
+                    },
+                )
 
             col, cols = col[0], col[1:]  # type: ignore[assignment]
 
-        if not all(isinstance(c, str) for c in cols) or not (isinstance(col, str)):
-            raise TypeError("all names should be `str`")
+        for c in cols:
+            if not isinstance(c, str):
+                raise PySparkTypeError(
+                    error_class="NOT_LIST_OF_STR",
+                    message_parameters={
+                        "arg_name": "cols",
+                        "arg_type": type(c).__name__,
+                    },
+                )
+        if not isinstance(col, str):
+            raise PySparkTypeError(
+                error_class="NOT_LIST_OF_STR",
+                message_parameters={
+                    "arg_name": "col",
+                    "arg_type": type(col).__name__,
+                },
+            )
 
         self._write.num_buckets = numBuckets
         self._write.bucket_cols = cast(List[str], [col, *cols])
@@ -439,12 +603,32 @@ class DataFrameWriter(OptionUtils):
     ) -> "DataFrameWriter":
         if isinstance(col, (list, tuple)):
             if cols:
-                raise ValueError("col is a {0} but cols are not empty".format(type(col)))
+                raise PySparkValueError(
+                    error_class="CANNOT_SET_TOGETHER",
+                    message_parameters={
+                        "arg_list": f"`col` of type {type(col).__name__} and `cols`",
+                    },
+                )
 
             col, cols = col[0], col[1:]  # type: ignore[assignment]
 
-        if not all(isinstance(c, str) for c in cols) or not (isinstance(col, str)):
-            raise TypeError("all names should be `str`")
+        for c in cols:
+            if not isinstance(c, str):
+                raise PySparkTypeError(
+                    error_class="NOT_LIST_OF_STR",
+                    message_parameters={
+                        "arg_name": "cols",
+                        "arg_type": type(c).__name__,
+                    },
+                )
+        if not isinstance(col, str):
+            raise PySparkTypeError(
+                error_class="NOT_LIST_OF_STR",
+                message_parameters={
+                    "arg_name": "col",
+                    "arg_type": type(col).__name__,
+                },
+            )
 
         self._write.sort_cols = cast(List[str], [col, *cols])
         return self
@@ -465,7 +649,9 @@ class DataFrameWriter(OptionUtils):
         if format is not None:
             self.format(format)
         self._write.path = path
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     save.__doc__ = PySparkDataFrameWriter.save.__doc__
 
@@ -474,7 +660,9 @@ class DataFrameWriter(OptionUtils):
             self.mode("overwrite" if overwrite else "append")
         self._write.table_name = tableName
         self._write.table_save_method = "insert_into"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     insertInto.__doc__ = PySparkDataFrameWriter.insertInto.__doc__
 
@@ -493,7 +681,9 @@ class DataFrameWriter(OptionUtils):
             self.format(format)
         self._write.table_name = name
         self._write.table_save_method = "save_as_table"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     saveAsTable.__doc__ = PySparkDataFrameWriter.saveAsTable.__doc__
 
@@ -588,6 +778,42 @@ class DataFrameWriter(OptionUtils):
 
     csv.__doc__ = PySparkDataFrameWriter.csv.__doc__
 
+    def xml(
+        self,
+        path: str,
+        rowTag: Optional[str] = None,
+        mode: Optional[str] = None,
+        attributePrefix: Optional[str] = None,
+        valueTag: Optional[str] = None,
+        rootTag: Optional[str] = None,
+        declaration: Optional[bool] = None,
+        arrayElementName: Optional[str] = None,
+        nullValue: Optional[str] = None,
+        dateFormat: Optional[str] = None,
+        timestampFormat: Optional[str] = None,
+        compression: Optional[str] = None,
+        encoding: Optional[str] = None,
+        validateName: Optional[bool] = None,
+    ) -> None:
+        self.mode(mode)
+        self._set_opts(
+            rowTag=rowTag,
+            attributePrefix=attributePrefix,
+            valueTag=valueTag,
+            rootTag=rootTag,
+            declaration=declaration,
+            arrayElementName=arrayElementName,
+            nullValue=nullValue,
+            dateFormat=dateFormat,
+            timestampFormat=timestampFormat,
+            compression=compression,
+            encoding=encoding,
+            validateName=validateName,
+        )
+        self.format("xml").save(path)
+
+    xml.__doc__ = PySparkDataFrameWriter.xml.__doc__
+
     def orc(
         self,
         path: str,
@@ -603,8 +829,19 @@ class DataFrameWriter(OptionUtils):
 
     orc.__doc__ = PySparkDataFrameWriter.orc.__doc__
 
-    def jdbc(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError("jdbc() not supported for DataFrameWriter")
+    def jdbc(
+        self,
+        url: str,
+        table: str,
+        mode: Optional[str] = None,
+        properties: Optional[Dict[str, str]] = None,
+    ) -> None:
+        if properties is None:
+            properties = dict()
+
+        self.format("jdbc").mode(mode).options(**properties).options(url=url, dbtable=table).save()
+
+    jdbc.__doc__ = PySparkDataFrameWriter.jdbc.__doc__
 
 
 class DataFrameWriterV2(OptionUtils):
@@ -640,64 +877,73 @@ class DataFrameWriterV2(OptionUtils):
     tableProperty.__doc__ = PySparkDataFrameWriterV2.tableProperty.__doc__
 
     def partitionedBy(self, col: "ColumnOrName", *cols: "ColumnOrName") -> "DataFrameWriterV2":
-        self._write.partitioning_columns = [col]
-        self._write.partitioning_columns.extend(cols)
+        self._write.partitioning_columns = [F._to_col(c) for c in [col] + list(cols)]
         return self
 
     partitionedBy.__doc__ = PySparkDataFrameWriterV2.partitionedBy.__doc__
 
     def create(self) -> None:
         self._write.mode = "create"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     create.__doc__ = PySparkDataFrameWriterV2.create.__doc__
 
     def replace(self) -> None:
         self._write.mode = "replace"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     replace.__doc__ = PySparkDataFrameWriterV2.replace.__doc__
 
     def createOrReplace(self) -> None:
         self._write.mode = "create_or_replace"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     createOrReplace.__doc__ = PySparkDataFrameWriterV2.createOrReplace.__doc__
 
     def append(self) -> None:
         self._write.mode = "append"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     append.__doc__ = PySparkDataFrameWriterV2.append.__doc__
 
     def overwrite(self, condition: "ColumnOrName") -> None:
         self._write.mode = "overwrite"
-        self._write.overwrite_condition = condition
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._write.overwrite_condition = F._to_col(condition)
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     overwrite.__doc__ = PySparkDataFrameWriterV2.overwrite.__doc__
 
     def overwritePartitions(self) -> None:
         self._write.mode = "overwrite_partitions"
-        self._spark.client.execute_command(self._write.command(self._spark.client))
+        self._spark.client.execute_command(
+            self._write.command(self._spark.client), self._write.observations
+        )
 
     overwritePartitions.__doc__ = PySparkDataFrameWriterV2.overwritePartitions.__doc__
 
 
 def _test() -> None:
     import sys
+    import os
     import doctest
     from pyspark.sql import SparkSession as PySparkSession
     import pyspark.sql.connect.readwriter
 
     globs = pyspark.sql.connect.readwriter.__dict__.copy()
 
-    # TODO(SPARK-42458): createDataFrame should support DDL string as schema
-    del pyspark.sql.connect.readwriter.DataFrameWriter.option.__doc__
-
     globs["spark"] = (
         PySparkSession.builder.appName("sql.connect.readwriter tests")
-        .remote("local[4]")
+        .remote(os.environ.get("SPARK_CONNECT_TESTING_REMOTE", "local[4]"))
         .getOrCreate()
     )
 
